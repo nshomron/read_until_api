@@ -13,6 +13,33 @@ import numpy
 
 import read_until
 
+import torch
+from torch import nn, optim
+from torch.autograd import Variable
+from torch.nn.utils import clip_grad_norm
+from torch.utils.data import TensorDataset, DataLoader
+from torchvision import datasets, transforms
+from nanopore_dataloader import NanoporeDataset, differences_transform, noise_transform,\
+								startMove_transform, cutToWindows_transform, startMove_transform_test
+
+model_path = "Models/13Jul_bnLSTM_32win_512Hidden_1layer_winlen32_withDropout_outputLastStep/Nanopore_model.pth"
+model= torch.load(model_path)
+
+def Signalstart(Signal):
+    Start_point, Pro_start, Pre_start = 0, [], []
+    Signal_lst = Signal.tolist()
+    Start_point = (Signal_lst.index(max(Signal_lst[10:3000])),max(Signal_lst[10:3000]))
+    Pre_start = Signal_lst[Start_point[0]-19:Start_point[0]-1]
+    Pro_start = Signal_lst[Start_point[0]+1:Start_point[0]+19]
+    if not Pro_start or not Pre_start:
+        return int("0")
+    if Start_point[1] > sum(Pre_start)/len(Pre_start):
+        if Start_point[1] > sum(Pro_start)/len(Pro_start):
+            if numpy.var(Signal[Start_point[0]+50:Start_point[0]+80]) > numpy.var(Signal[Start_point[0]-80:Start_point[0]-50]):
+                return(Start_point[0])
+    ## if couldnt find valid start poin then return 0 as start point
+    return int("0")
+
 class ThreadPoolExecutorStackTraced(concurrent.futures.ThreadPoolExecutor):
     """ThreadPoolExecutor records only the text of an exception,
     this class will give back a bit more."""
@@ -92,22 +119,57 @@ def simple_analysis(client, batch_size=10, delay=1, throttle=0.1, unblock_durati
     # we sleep a little simply to ensure the client has started initialised
     logger.info('Starting analysis of reads in {}s.'.format(delay))
     time.sleep(delay)
+    badMitoReadCounter = 0
+    notMitoReadCounter = 0
+    yesMitoReadCounter = 0
 
     while client.is_running:
         t0 = time.time()
         # get the most recent read chunks from the client
         read_batch = client.get_read_chunks(batch_size=batch_size, last=True)
+        readsToAnalyzeList = []
+        numpy_sample_List = []
         for channel, read in read_batch:
+            
             # convert the read data into a numpy array of correct type
-            raw_data = numpy.fromstring(read.raw_data, client.signal_dtype)
-            read.raw_data = read_until.NullRaw
+            raw_data = numpy.fromstring(read.raw_data, "int16")
+            stride = 1
+            winLength = 1
+            seqLength = 2000
+            raw_data = raw_data.astype("int16")
+            signalStart = Signalstart(raw_data)
+            if (signalStart == 0):
+                badMitoReadCounter += 1
+                client.unblock_read(channel, read.number)
+                continue
+            raw_data=raw_data[signalStart:]
+            if (len(raw_data) < 2001):
+                badMitoReadCounter += 1
+                client.unblock_read(channel, read.number)
+                continue
+            readsToAnalyzeList.append((channel, read))
+            raw_data=differences_transform(raw_data)
+            raw_data=cutToWindows_transform(raw_data, seqLength, stride, winLength)
+            numpy_sample_List.append(raw_data)
 
-            # make a decision that the read is good at we don't need more data?
-            if read.median_before > read.median and \
-               read.median_before - read.median > 60:
-                client.stop_receiving_read(channel, read.number)
-            # we can also call the following for reads we don't like
-            client.unblock_read(channel, read.number, duration=unblock_duration)
+        if len(numpy_sample_List) == 0:
+            pass
+        else:
+            numpy_sample_npList = numpy.stack(numpy_sample_List)
+
+            tensorRead = torch.from_numpy(numpy_sample_npList).float()
+            tensorRead = Variable(tensorRead).cuda()
+            logits = model(input_=tensorRead)
+            for channel_read_index, channel_read_tupple in enumerate(readsToAnalyzeList):
+                channel = channel_read_tupple[0]
+                read = channel_read_tupple[1]
+                if logits[channel_read_index][1].data > 0.999:
+                    yesMitoReadCounter += 1
+                    client.stop_receiving_read(channel, read.number)
+                    print("YESS")
+                else:
+                    client.unblock_read(channel, read.number)
+                    notMitoReadCounter += 1
 
         # limit the rate at which we make requests            
         t1 = time.time()
@@ -115,6 +177,9 @@ def simple_analysis(client, batch_size=10, delay=1, throttle=0.1, unblock_durati
             time.sleep(throttle + t0 - t1)
     else:
         logger.info('Finished analysis of reads as client stopped.')
+        print(badMitoReadCounter)
+        print(notMitoReadCounter)
+        print(yesMitoReadCounter)
 
 
 def run_workflow(client, analysis_worker, n_workers, run_time,
